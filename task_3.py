@@ -1,214 +1,135 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Индикатор состояния «Движение/Покой» для Promobot M Edu через UART.
-
-Функции:
-- Подписка на состояния суставов (J1..J3) через pm_python_sdk.
-- Детект движения по скоростям (если есть) или по производной углов.
-- UART-команды для LED-модуля: "BLINK 2\n" при движении, "OFF\n" при покое.
-- Реакция < 0.2 с за счёт вызова из колбэка.
-- Безопасная демо-траектория: поворот основания слева-направо и обратно.
-
-Зависимости:
-  pip install pyserial
-  pip install /path/to/pm_python_sdk-0.6.6.tar.gz
-
-Пример запуска:
-  python led_motion_indicator.py --host 192.168.1.42 --client-id demo \
-      --login user --password pass --uart /dev/serial0 --demo
-"""
-from __future__ import annotations
-import time
+# play_saved_points.py
 import json
-import math
-import signal
-import argparse
-import threading
-from typing import Dict, Optional
+import time
+from pathlib import Path
+from typing import Tuple, Dict, Any
 
-import serial  # pyserial
-from sdk.manipulators.medu import MEdu  # из pm_python_sdk
+from sdk.manipulators.medu import MEdu
+from sdk.commands.move_coordinates_command import (
+    MoveCoordinatesParamsPosition,
+    MoveCoordinatesParamsOrientation,
+    PlannerType,
+)
 
+HOST = "172.16.2.190"
+LOGIN = "user"
+PASSWORD = "pass"
+CLIENT_ID = "cells-calib-001"
 
-class UARTLed:
-    """Мини-драйвер UART-LED. Говорим модулю: BLINK <hz> / OFF."""
-    def __init__(self, port: str = "/dev/serial0", baud: int = 115200, timeout: float = 0.05):
-        self.ser = serial.Serial(port=port, baudrate=baud, timeout=timeout)
-        self._last_mode = None
-        self._lock = threading.Lock()
+COORDS_FILE = Path("coords3.json")
 
-    def _send(self, msg: str) -> None:
-        with self._lock:
-            if not self.ser.is_open:
-                self.ser.open()
-            self.ser.write(msg.encode("ascii"))
-            self.ser.flush()
+# Параметры траектории (скейлы <0..1>)
+VELOCITY_SCALE = 0.2
+ACCEL_SCALE = 0.2
+PLANNER = PlannerType.PTP  # или PlannerType.LINEAR при необходимости
 
-    def blink(self, hz: float = 2.0) -> None:
-        mode = f"BLINK {hz:.3g}\n"
-        if self._last_mode != mode:
-            self._send(mode)
-            self._last_mode = mode
-
-    def off(self) -> None:
-        mode = "OFF\n"
-        if self._last_mode != mode:
-            self._send(mode)
-            self._last_mode = mode
-
-    def close(self) -> None:
-        try:
-            self.off()
-        finally:
-            try:
-                self.ser.close()
-            except Exception:
-                pass
+# Пауза между точками (сек), если нужна визуальная «ступенька»
+DWELL_BETWEEN_POINTS = 0.0
 
 
-class MotionWatcher:
+def pose_to_params(pose: Dict[str, Any]) -> Tuple[MoveCoordinatesParamsPosition, MoveCoordinatesParamsOrientation]:
     """
-    Отслеживает движение по данным joint-state.
-    'moving' = True, если есть скорости > vel_thresh,
-    либо если |Δугол|/Δt > vel_thresh (оценка скорости).
+    Приводит словарь позы (как вернул get_cartesian_coordinates) к параметрам MoveCoordinates*.
+    Ожидается структура:
+      {
+        "position": {"x": ..., "y": ..., "z": ...},
+        "orientation": {"x": ..., "y": ..., "z": ..., "w": ...}
+      }
+    Допущение: если 'position'/'orientation' нет, пробуем взять плоские ключи.
     """
-    def __init__(self, vel_thresh: float = 0.01):
-        self.vel_thresh = float(vel_thresh)  # рад/с
-        self.last_t: Optional[float] = None
-        self.last_pos: Optional[Dict[str, float]] = None
-        self.moving = False
-        self._lock = threading.Lock()
+    if isinstance(pose, str):
+        pose = json.loads(pose)
 
-    def _compute_speed_mag(self, p_prev: Dict[str, float], p_now: Dict[str, float], dt: float) -> float:
-        mags = []
-        for j in p_now:
-            if j in p_prev:
-                dv = abs((p_now[j] - p_prev[j]) / max(dt, 1e-6))
-                mags.append(dv)
-        return max(mags) if mags else 0.0
+    if "position" in pose and "orientation" in pose:
+        p = pose["position"]
+        o = pose["orientation"]
+        pos = MoveCoordinatesParamsPosition(float(p["x"]), float(p["y"]), float(p["z"]))
+        ori = MoveCoordinatesParamsOrientation(float(o["x"]), float(o["y"]), float(o["z"]), float(o["w"]))
+        return pos, ori
 
-    def on_joint_state(self, data: Dict) -> bool:
-        """
-        Колбэк для MEdu.subscribe_to_joint_state.
-        Ожидаемый формат data:
-          {"positions": {"povorot_osnovaniya": float, "privod_plecha": float, "privod_strely": float},
-           "velocities": {"povorot_osnovaniya": float, "privod_plecha": float, "privod_strely": float}}
-        Но обрабатываем и другие разумные варианты.
-        Возвращает новое состояние moving.
-        """
-        try:
-            # Универсальный разбор
-            if "positions" in data and isinstance(data["positions"], dict):
-                positions = {k: float(v) for k, v in data["positions"].items()}
-            else:
-                # fallback: плоский словарь углов
-                positions = {k: float(v) for k, v in data.items() if isinstance(v, (int, float))}
+    # Фоллбек: плоские ключи
+    keys = set(pose.keys())
+    if {"x", "y", "z", "w"}.issubset(keys):
+        pos = MoveCoordinatesParamsPosition(float(pose["x"]), float(pose["y"]), float(pose["z"]))
+        ori = MoveCoordinatesParamsOrientation(float(pose["x"]), float(pose["y"]), float(pose["z"]), float(pose["w"]))
+        return pos, ori
 
-            velocities = {}
-            if "velocities" in data and isinstance(data["velocities"], dict):
-                velocities = {k: float(v) for k, v in data["velocities"].items()}
+    if {"x", "y", "z", "qx", "qy", "qz", "qw"}.issubset(keys):
+        pos = MoveCoordinatesParamsPosition(float(pose["x"]), float(pose["y"]), float(pose["z"]))
+        ori = MoveCoordinatesParamsOrientation(float(pose["qx"]), float(pose["qy"]), float(pose["qz"]), float(pose["qw"]))
+        return pos, ori
 
-            t_now = time.monotonic()
-            moving_detected = False
-
-            # 1) Если есть скорости, используем их
-            if velocities:
-                moving_detected = any(abs(v) > self.vel_thresh for v in velocities.values())
-            # 2) Иначе оцениваем производную по углам
-            else:
-                if self.last_t is not None and self.last_pos is not None:
-                    dt = t_now - self.last_t
-                    if dt > 0:
-                        vmax = self._compute_speed_mag(self.last_pos, positions, dt)
-                        moving_detected = vmax > self.vel_thresh
-
-            # Обновить last-данные
-            self.last_t = t_now
-            self.last_pos = positions
-
-            with self._lock:
-                self.moving = moving_detected
-            return moving_detected
-        except Exception:
-            return self.moving
-
-    def is_moving(self) -> bool:
-        with self._lock:
-            return self.moving
+    raise ValueError(f"Неподдерживаемый формат позы: {pose}")
 
 
-def safe_demo(manip: MEdu) -> None:
+def rotate_gripper(manip: MEdu, angle_deg: int, power_on: bool = True, power_off_after: bool = False) -> None:
     """
-    Безопасная демонстрация: база к левому краю, затем к правому, затем в центр.
-    Параметры подобраны мягкие (0.2), чтобы избежать рывков и случайных контактов.
-    Перед запуском УБЕДИСЬ, что в радиусе ≥1 м от основания нет предметов.  # см. руководство
+    Вращение захвата (насадки) на заданный угол в градусах.
+    Для работы требуется питание на разъёмах стрелы.
     """
-    manip.get_control()
-    # Базовая «высокая» поза: плечо и стрела в средних значениях.
-    manip.move_to_angles(0.0, 0.40, 1.00, velocity_factor=0.20, acceleration_factor=0.20)
-    # Левое крайнее (не абсолютный предел)
-    manip.move_to_angles(-2.40, 0.40, 1.00, velocity_factor=0.20, acceleration_factor=0.20)
-    # Правое крайнее (не абсолютный предел)
-    manip.move_to_angles( 2.40, 0.40, 1.00, velocity_factor=0.20, acceleration_factor=0.20)
-    # Возврат в центр
-    manip.move_to_angles(0.0, 0.40, 1.00, velocity_factor=0.20, acceleration_factor=0.20)
+    if power_on:
+        manip.nozzle_power(True)
+    manip.manage_gripper(rotation=int(angle_deg))
+    if power_off_after:
+        manip.nozzle_power(False)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="LED-индикатор движения M Edu через UART")
-    ap.add_argument("--host", required=True, help="IP адрес манипулятора (MQTT брокер)")
-    ap.add_argument("--client-id", default="motion-led", help="Клиент ID")
-    ap.add_argument("--login", default="user", help="Логин MQTT")
-    ap.add_argument("--password", default="pass", help="Пароль MQTT")
-    ap.add_argument("--uart", default="/dev/serial0", help="UART-порт (например, /dev/serial0 или /dev/ttyAMA0)")
-    ap.add_argument("--baud", type=int, default=115200, help="Скорость UART, бод")
-    ap.add_argument("--vel-thresh", type=float, default=0.01, help="Порог скорости, рад/с")
-    ap.add_argument("--demo", action="store_true", help="Запустить демонстрационное движение")
-    args = ap.parse_args()
+    print("=== Проход по сохранённым точкам ===")
 
-    led = UARTLed(port=args.uart, baud=args.baud)
-    manip = MEdu(args.host, args.client_id, args.login, args.password)
+    if not COORDS_FILE.exists():
+        raise FileNotFoundError(f"Файл с точками не найден: {COORDS_FILE.resolve()}")
 
-    stop_flag = {"stop": False}
+    saved = json.loads(COORDS_FILE.read_text(encoding="utf-8"))
+    if not isinstance(saved, dict) or not saved:
+        raise ValueError(f"В {COORDS_FILE} нет валидных точек.")
 
-    def handle_sigint(sig, frame):
-        stop_flag["stop"] = True
+    # Порядок dict сохранится таким, как был записан в coords3.json
+    points = list(saved.items())
+    print(f"[*] Найдено точек: {len(points)}")
 
-    signal.signal(signal.SIGINT, handle_sigint)
-    signal.signal(signal.SIGTERM, handle_sigint)
-
-    print("[INFO] Подключение к манипулятору…")
+    manip = MEdu(HOST, CLIENT_ID, LOGIN, PASSWORD)
+    print("[*] Подключаемся…")
     manip.connect()
-
-    watcher = MotionWatcher(vel_thresh=args.vel_thresh)
-
-    def joint_callback(data: Dict):
-        moving = watcher.on_joint_state(data)
-        # Мгновенно обновить LED по изменению состояния
-        if moving:
-            led.blink(2.0)   # режим «Движение»: 2 Гц
-        else:
-            led.off()        # режим «Покой»: выключен
-
-    manip.subscribe_to_joint_state(joint_callback)
-    print("[OK] Подписка на состояние суставов активна. Индикатор готов.")
+    print("[+] Подключено.")
 
     try:
-        if args.demo:
-            print("[DEMO] Старт безопасной демонстрации (лево → право → центр)…")
-            safe_demo(manip)
-            print("[DEMO] Демонстрация завершена.")
-        # Основной цикл ничего не делает — работаем по колбэку, но держим процесс живым.
-        while not stop_flag["stop"]:
-            time.sleep(0.1)
+        manip.get_control()
+        print("[+] Получено управление манипулятором.")
+
+        for i, (name, pose) in enumerate(points, start=1):
+            try:
+                pos, ori = pose_to_params(pose)
+            except Exception as e:
+                print(f"[!] Пропуск «{name}»: не удалось разобрать позу ({e})")
+                continue
+
+            print(f"\n[{i}/{len(points)}] Едем в «{name}» ...")
+            manip.move_to_coordinates(
+                pos,
+                ori,
+                VELOCITY_SCALE,
+                ACCEL_SCALE,
+                PLANNER,
+                timeout_seconds=60.0,
+                throw_error=True,
+            )
+            print(f"    [✓] Достигнута «{name}»")
+
+            if DWELL_BETWEEN_POINTS > 0:
+                time.sleep(DWELL_BETWEEN_POINTS)
+
+        print("\n[✓] Маршрут завершён.")
+
+        # Пример использования вращения захвата (по необходимости):
+        # rotate_gripper(manip, angle_deg=45)  # раскомментируйте для теста
+
     finally:
-        print("\n[CLEANUP] Выключаем LED и снимаем подписку…")
         try:
-            manip.unsubscribe_from_joint_state()
+            manip.disconnect()
+            print("[*] Отключено.")
         except Exception:
             pass
-        led.close()
 
 
 if __name__ == "__main__":
