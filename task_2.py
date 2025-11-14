@@ -1,214 +1,210 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Индикатор состояния «Движение/Покой» для Promobot M Edu через UART.
-
-Функции:
-- Подписка на состояния суставов (J1..J3) через pm_python_sdk.
-- Детект движения по скоростям (если есть) или по производной углов.
-- UART-команды для LED-модуля: "BLINK 2\n" при движении, "OFF\n" при покое.
-- Реакция < 0.2 с за счёт вызова из колбэка.
-- Безопасная демо-траектория: поворот основания слева-направо и обратно.
-
-Зависимости:
-  pip install pyserial
-  pip install /path/to/pm_python_sdk-0.6.6.tar.gz
-
-Пример запуска:
-  python led_motion_indicator.py --host 192.168.1.42 --client-id demo \
-      --login user --password pass --uart /dev/serial0 --demo
+Индикатор движения манипулятора Promobot M Edu через GPIO.
+Если рука движется — светодиод моргает с частотой 2 Гц.
+Если покой — светодиод выключен.
 """
-from __future__ import annotations
+
 import time
-import json
-import math
 import signal
-import argparse
 import threading
 from typing import Dict, Optional
 
-import serial  # pyserial
-from sdk.manipulators.medu import MEdu  # из pm_python_sdk
+from sdk.manipulators.medu import MEdu
+
+# --- Настройки ---
+HOST = "10.5.0.2"
+LOGIN = "user"
+PASSWORD = "pass"
+CLIENT_ID = "cells-calib-001"
+GPIO_LED_PATH = "/dev/gpiochip4/e1_pin"
+VELOCITY_THRESHOLD = 0.01  # Порог скорости в рад/с для определения движения
+
+# --- Константы для мигания светодиода ---
+BLINK_FREQUENCY_HZ = 2  # Частота мигания 2 Гц
+BLINK_HALF_PERIOD = 0.25  # Половина периода (0.5 с / 2 = 0.25 с вкл/выкл)
 
 
-class UARTLed:
-    """Мини-драйвер UART-LED. Говорим модулю: BLINK <hz> / OFF."""
-    def __init__(self, port: str = "/dev/serial0", baud: int = 115200, timeout: float = 0.05):
-        self.ser = serial.Serial(port=port, baudrate=baud, timeout=timeout)
-        self._last_mode = None
-        self._lock = threading.Lock()
+class GpioLedController:
+    """Контроллер управления светодиодом через GPIO"""
 
-    def _send(self, msg: str) -> None:
-        with self._lock:
-            if not self.ser.is_open:
-                self.ser.open()
-            self.ser.write(msg.encode("ascii"))
-            self.ser.flush()
+    def __init__(self, manipulator: MEdu, gpio_path: str):
+        self.manipulator = manipulator
+        self.gpio_path = gpio_path
+        self._is_blinking = False
+        self._blink_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
 
-    def blink(self, hz: float = 2.0) -> None:
-        mode = f"BLINK {hz:.3g}\n"
-        if self._last_mode != mode:
-            self._send(mode)
-            self._last_mode = mode
-
-    def off(self) -> None:
-        mode = "OFF\n"
-        if self._last_mode != mode:
-            self._send(mode)
-            self._last_mode = mode
-
-    def close(self) -> None:
+    def _blink_loop(self):
+        """Цикл мигания светодиода в отдельном потоке"""
         try:
-            self.off()
+            while not self._stop_event.is_set():
+                # Включаем светодиод
+                self.manipulator.write_gpio(self.gpio_path, 1)
+                if self._stop_event.wait(timeout=BLINK_HALF_PERIOD):
+                    break
+
+                # Выключаем светодиод
+                self.manipulator.write_gpio(self.gpio_path, 0)
+                if self._stop_event.wait(timeout=BLINK_HALF_PERIOD):
+                    break
+        except Exception:
+            pass
         finally:
+            # Гарантируем выключение светодиода при выходе
             try:
-                self.ser.close()
+                self.manipulator.write_gpio(self.gpio_path, 0)
             except Exception:
                 pass
 
+    def start_blinking(self):
+        """Запуск мигания светодиода"""
+        if self._is_blinking:
+            return
+
+        self._stop_event.clear()
+        self._blink_thread = threading.Thread(target=self._blink_loop, daemon=True)
+        self._blink_thread.start()
+        self._is_blinking = True
+
+    def stop_blinking(self):
+        """Остановка мигания светодиода"""
+        if not self._is_blinking:
+            return
+
+        self._stop_event.set()
+        if self._blink_thread:
+            self._blink_thread.join(timeout=0.3)
+
+        self._is_blinking = False
+
+        # Выключаем светодиод
+        try:
+            self.manipulator.write_gpio(self.gpio_path, 0)
+        except Exception:
+            pass
+
 
 class MotionWatcher:
-    """
-    Отслеживает движение по данным joint-state.
-    'moving' = True, если есть скорости > vel_thresh,
-    либо если |Δугол|/Δt > vel_thresh (оценка скорости).
-    """
-    def __init__(self, vel_thresh: float = 0.01):
-        self.vel_thresh = float(vel_thresh)  # рад/с
-        self.last_t: Optional[float] = None
-        self.last_pos: Optional[Dict[str, float]] = None
-        self.moving = False
+    """Наблюдатель за движением манипулятора"""
+
+    def __init__(self, velocity_threshold: float):
+        self.velocity_threshold = velocity_threshold
+        self.last_timestamp: Optional[float] = None
+        self.last_positions: Optional[Dict[str, float]] = None
+        self.is_moving_flag = False
         self._lock = threading.Lock()
 
-    def _compute_speed_mag(self, p_prev: Dict[str, float], p_now: Dict[str, float], dt: float) -> float:
-        mags = []
-        for j in p_now:
-            if j in p_prev:
-                dv = abs((p_now[j] - p_prev[j]) / max(dt, 1e-6))
-                mags.append(dv)
-        return max(mags) if mags else 0.0
+    def _compute_max_joint_speed(
+            self,
+            positions_previous: Dict[str, float],
+            positions_current: Dict[str, float],
+            time_delta: float
+    ) -> float:
+        """Вычисление максимальной скорости среди всех суставов"""
+        joint_speeds = []
 
-    def on_joint_state(self, data: Dict) -> bool:
+        for joint_name in positions_current:
+            if joint_name in positions_previous:
+                # Вычисляем скорость как изменение позиции за время
+                speed = abs((positions_current[joint_name] - positions_previous[joint_name]) / max(time_delta, 1e-6))
+                joint_speeds.append(speed)
+
+        return max(joint_speeds) if joint_speeds else 0.0
+
+    def on_joint_state(self, joint_data: Dict) -> bool:
         """
-        Колбэк для MEdu.subscribe_to_joint_state.
-        Ожидаемый формат data:
-          {"positions": {"povorot_osnovaniya": float, "privod_plecha": float, "privod_strely": float},
-           "velocities": {"povorot_osnovaniya": float, "privod_plecha": float, "privod_strely": float}}
-        Но обрабатываем и другие разумные варианты.
-        Возвращает новое состояние moving.
+        Обработка данных о состоянии суставов.
+        Возвращает True, если обнаружено движение.
         """
         try:
-            # Универсальный разбор
-            if "positions" in data and isinstance(data["positions"], dict):
-                positions = {k: float(v) for k, v in data["positions"].items()}
+            # Извлекаем позиции суставов
+            if "positions" in joint_data and isinstance(joint_data["positions"], dict):
+                current_positions = {key: float(value) for key, value in joint_data["positions"].items()}
             else:
-                # fallback: плоский словарь углов
-                positions = {k: float(v) for k, v in data.items() if isinstance(v, (int, float))}
+                current_positions = {key: float(value) for key, value in joint_data.items() if
+                                     isinstance(value, (int, float))}
 
-            velocities = {}
-            if "velocities" in data and isinstance(data["velocities"], dict):
-                velocities = {k: float(v) for k, v in data["velocities"].items()}
+            # Извлекаем скорости суставов (если есть)
+            current_velocities = {}
+            if "velocities" in joint_data and isinstance(joint_data["velocities"], dict):
+                current_velocities = {key: float(value) for key, value in joint_data["velocities"].items()}
 
-            t_now = time.monotonic()
-            moving_detected = False
+            current_time = time.monotonic()
+            movement_detected = False
 
-            # 1) Если есть скорости, используем их
-            if velocities:
-                moving_detected = any(abs(v) > self.vel_thresh for v in velocities.values())
-            # 2) Иначе оцениваем производную по углам
+            # Способ 1: используем скорости, если они доступны
+            if current_velocities:
+                movement_detected = any(
+                    abs(velocity) > self.velocity_threshold for velocity in current_velocities.values())
+
+            # Способ 2: вычисляем скорость по изменению позиций
             else:
-                if self.last_t is not None and self.last_pos is not None:
-                    dt = t_now - self.last_t
-                    if dt > 0:
-                        vmax = self._compute_speed_mag(self.last_pos, positions, dt)
-                        moving_detected = vmax > self.vel_thresh
+                if self.last_timestamp is not None and self.last_positions is not None:
+                    time_delta = current_time - self.last_timestamp
+                    if time_delta > 0:
+                        max_speed = self._compute_max_joint_speed(self.last_positions, current_positions, time_delta)
+                        movement_detected = max_speed > self.velocity_threshold
 
-            # Обновить last-данные
-            self.last_t = t_now
-            self.last_pos = positions
+            # Обновляем последние известные значения
+            self.last_timestamp = current_time
+            self.last_positions = current_positions
 
+            # Потокобезопасное обновление флага движения
             with self._lock:
-                self.moving = moving_detected
-            return moving_detected
+                self.is_moving_flag = movement_detected
+
+            return movement_detected
+
         except Exception:
-            return self.moving
+            return self.is_moving_flag
 
     def is_moving(self) -> bool:
+        """Проверка, движется ли манипулятор в данный момент"""
         with self._lock:
-            return self.moving
-
-
-def safe_demo(manip: MEdu) -> None:
-    """
-    Безопасная демонстрация: база к левому краю, затем к правому, затем в центр.
-    Параметры подобраны мягкие (0.2), чтобы избежать рывков и случайных контактов.
-    Перед запуском УБЕДИСЬ, что в радиусе ≥1 м от основания нет предметов.  # см. руководство
-    """
-    manip.get_control()
-    # Базовая «высокая» поза: плечо и стрела в средних значениях.
-    manip.move_to_angles(0.0, 0.40, 1.00, velocity_factor=0.20, acceleration_factor=0.20)
-    # Левое крайнее (не абсолютный предел)
-    manip.move_to_angles(-2.40, 0.40, 1.00, velocity_factor=0.20, acceleration_factor=0.20)
-    # Правое крайнее (не абсолютный предел)
-    manip.move_to_angles( 2.40, 0.40, 1.00, velocity_factor=0.20, acceleration_factor=0.20)
-    # Возврат в центр
-    manip.move_to_angles(0.0, 0.40, 1.00, velocity_factor=0.20, acceleration_factor=0.20)
+            return self.is_moving_flag
 
 
 def main():
-    ap = argparse.ArgumentParser(description="LED-индикатор движения M Edu через UART")
-    ap.add_argument("--host", required=True, help="IP адрес манипулятора (MQTT брокер)")
-    ap.add_argument("--client-id", default="motion-led", help="Клиент ID")
-    ap.add_argument("--login", default="user", help="Логин MQTT")
-    ap.add_argument("--password", default="pass", help="Пароль MQTT")
-    ap.add_argument("--uart", default="/dev/serial0", help="UART-порт (например, /dev/serial0 или /dev/ttyAMA0)")
-    ap.add_argument("--baud", type=int, default=115200, help="Скорость UART, бод")
-    ap.add_argument("--vel-thresh", type=float, default=0.01, help="Порог скорости, рад/с")
-    ap.add_argument("--demo", action="store_true", help="Запустить демонстрационное движение")
-    args = ap.parse_args()
+    stop_requested = {"stop": False}
 
-    led = UARTLed(port=args.uart, baud=args.baud)
-    manip = MEdu(args.host, args.client_id, args.login, args.password)
-
-    stop_flag = {"stop": False}
-
-    def handle_sigint(sig, frame):
-        stop_flag["stop"] = True
+    def handle_sigint(signal_number, frame):
+        """Обработчик сигнала прерывания (Ctrl+C)"""
+        stop_requested["stop"] = True
 
     signal.signal(signal.SIGINT, handle_sigint)
     signal.signal(signal.SIGTERM, handle_sigint)
 
-    print("[INFO] Подключение к манипулятору…")
-    manip.connect()
+    print("[INFO] Создание подключения к манипулятору...")
+    manipulator = MEdu(HOST, CLIENT_ID, LOGIN, PASSWORD)
+    led_controller = GpioLedController(manipulator, GPIO_LED_PATH)
 
-    watcher = MotionWatcher(vel_thresh=args.vel_thresh)
+    print("[INFO] Подключение...")
+    manipulator.connect()
 
-    def joint_callback(data: Dict):
-        moving = watcher.on_joint_state(data)
-        # Мгновенно обновить LED по изменению состояния
-        if moving:
-            led.blink(2.0)   # режим «Движение»: 2 Гц
+    motion_watcher = MotionWatcher(VELOCITY_THRESHOLD)
+
+    def joint_state_callback(joint_data: Dict):
+        """Callback для обработки данных о состоянии суставов"""
+        is_moving = motion_watcher.on_joint_state(joint_data)
+        if is_moving:
+            led_controller.start_blinking()
         else:
-            led.off()        # режим «Покой»: выключен
+            led_controller.stop_blinking()
 
-    manip.subscribe_to_joint_state(joint_callback)
-    print("[OK] Подписка на состояние суставов активна. Индикатор готов.")
+    manipulator.subscribe_to_joint_state(joint_state_callback)
+
+    print("[OK] Индикатор движения запущен. Нажмите Ctrl+C для остановки.")
 
     try:
-        if args.demo:
-            print("[DEMO] Старт безопасной демонстрации (лево → право → центр)…")
-            safe_demo(manip)
-            print("[DEMO] Демонстрация завершена.")
-        # Основной цикл ничего не делает — работаем по колбэку, но держим процесс живым.
-        while not stop_flag["stop"]:
+        while not stop_requested["stop"]:
             time.sleep(0.1)
     finally:
-        print("\n[CLEANUP] Выключаем LED и снимаем подписку…")
+        print("\n[CLEANUP] Выключение LED...")
+        led_controller.stop_blinking()
         try:
-            manip.unsubscribe_from_joint_state()
+            manipulator.unsubscribe_from_joint_state()
         except Exception:
             pass
-        led.close()
 
 
 if __name__ == "__main__":

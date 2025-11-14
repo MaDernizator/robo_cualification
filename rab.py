@@ -241,34 +241,18 @@ def traverse_points_from_coords(m: MEdu) -> None:
     """
     names = list(data.keys())
 
-    # Отделим HOME, если он есть
-    home_name = None
-    for name in names:
-        if name.upper() == "HOME":
-            home_name = name
-            break
-
-    if home_name is not None:
-        print(f"[=] Старт из {home_name}.tool0")
-        move_pose(m, home_name, "tool0")
-        # Исключим HOME из последовательности обхода
-        names = [n for n in names if n != home_name]
-
+    m.nozzle_power(True)
     print("[=] Обход точек в порядке, как они идут в coords3.json:")
     for name in names:
+        if name == 'p3':
+            m.manage_gripper(rotation=0, gripper=10)
+        if name == 'p5':
+            m.manage_gripper(rotation=80, gripper=10)
+        if name == 'B':
+            m.manage_gripper(rotation=-10, gripper=10)
         print(f"  -> {name}.tool0")
         if "tool0" in data[name]:
             move_pose(m, name, "tool0")
-        # # Если есть «нижняя» точка — тоже посещаем
-        # if "tool1" in data[name]:
-        #     print(f"  -> {name}.tool1")
-        #     move_pose(m, name, "tool1")
-        #     # Поднимаемся обратно над точкой
-        #     move_pose(m, name, "tool0")
-
-    # if home_name is not None:
-    #     print(f"[=] Возврат в {home_name}.tool0")
-    #     move_pose(m, home_name, "tool0")
 
     print("[✓] Обход всех точек завершён")
 

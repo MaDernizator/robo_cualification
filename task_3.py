@@ -1,135 +1,288 @@
-# play_saved_points.py
 import json
+import sys
 import time
 from pathlib import Path
-from typing import Tuple, Dict, Any
+from typing import Any, Callable, Dict, List, Optional
 
-from sdk.manipulators.medu import MEdu
 from sdk.commands.move_coordinates_command import (
     MoveCoordinatesParamsPosition,
     MoveCoordinatesParamsOrientation,
-    PlannerType,
 )
+from sdk.manipulators.medu import MEdu
 
-HOST = "172.16.2.190"
+# ===================== КОНФИГУРАЦИЯ =====================
+
+HOST = "10.5.0.2"
+CLIENT_ID = "test-client"
 LOGIN = "user"
 PASSWORD = "pass"
-CLIENT_ID = "cells-calib-001"
 
 COORDS_FILE = Path("coords3.json")
 
-# Параметры траектории (скейлы <0..1>)
-VELOCITY_SCALE = 0.2
-ACCEL_SCALE = 0.2
-PLANNER = PlannerType.PTP  # или PlannerType.LINEAR при необходимости
+CELL_DESCENT_ROT = -5.0  # градусы, перед спуском в любую CELL_*
+BUFFER_DESCENT_ROT = -11.0  # градусы, перед спуском в BUFFER/BUFF
 
-# Пауза между точками (сек), если нужна визуальная «ступенька»
-DWELL_BETWEEN_POINTS = 0.0
+# Положение "открыть/закрыть" для механического захвата
+GRIP_OPEN_ANGLE = 15
+GRIP_CLOSE_ANGLE = 45
+GRIP_ROTATION = 0
+
+# Профиль движения
+VEL = 0.2
+ACC = 0.2
+
+# Дополнительные действия с захватом при обходе точек
+SEQUENCE_GRIP_ACTIONS: Dict[str, Dict[str, float]] = {
+    "p3": {"rotation": 0.0, "angle": 10.0},
+    "p5": {"rotation": 80.0, "angle": 10.0},
+    "B": {"rotation": -10.0, "angle": 10.0},
+}
+
+CoordinatesData = Dict[str, Dict[str, Dict[str, Any]]]
 
 
-def pose_to_params(pose: Dict[str, Any]) -> Tuple[MoveCoordinatesParamsPosition, MoveCoordinatesParamsOrientation]:
+# ===================== УТИЛИТЫ =====================
+
+def safe_sdk_call(
+        description: str,
+        func: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+) -> Any:
     """
-    Приводит словарь позы (как вернул get_cartesian_coordinates) к параметрам MoveCoordinates*.
-    Ожидается структура:
-      {
-        "position": {"x": ..., "y": ..., "z": ...},
-        "orientation": {"x": ..., "y": ..., "z": ..., "w": ...}
-      }
-    Допущение: если 'position'/'orientation' нет, пробуем взять плоские ключи.
+    Универсальный обёртка для внешних вызовов SDK.
+    Логирует ошибку и пробрасывает исключение дальше.
     """
-    if isinstance(pose, str):
-        pose = json.loads(pose)
-
-    if "position" in pose and "orientation" in pose:
-        p = pose["position"]
-        o = pose["orientation"]
-        pos = MoveCoordinatesParamsPosition(float(p["x"]), float(p["y"]), float(p["z"]))
-        ori = MoveCoordinatesParamsOrientation(float(o["x"]), float(o["y"]), float(o["z"]), float(o["w"]))
-        return pos, ori
-
-    # Фоллбек: плоские ключи
-    keys = set(pose.keys())
-    if {"x", "y", "z", "w"}.issubset(keys):
-        pos = MoveCoordinatesParamsPosition(float(pose["x"]), float(pose["y"]), float(pose["z"]))
-        ori = MoveCoordinatesParamsOrientation(float(pose["x"]), float(pose["y"]), float(pose["z"]), float(pose["w"]))
-        return pos, ori
-
-    if {"x", "y", "z", "qx", "qy", "qz", "qw"}.issubset(keys):
-        pos = MoveCoordinatesParamsPosition(float(pose["x"]), float(pose["y"]), float(pose["z"]))
-        ori = MoveCoordinatesParamsOrientation(float(pose["qx"]), float(pose["qy"]), float(pose["qz"]), float(pose["qw"]))
-        return pos, ori
-
-    raise ValueError(f"Неподдерживаемый формат позы: {pose}")
+    try:
+        return func(*args, **kwargs)
+    except Exception as exc:
+        print(f"[!] Ошибка {description}: {exc}")
+        raise
 
 
-def rotate_gripper(manip: MEdu, angle_deg: int, power_on: bool = True, power_off_after: bool = False) -> None:
+def load_coordinates(path: Path) -> CoordinatesData:
     """
-    Вращение захвата (насадки) на заданный угол в градусах.
-    Для работы требуется питание на разъёмах стрелы.
+    Читает и валидирует JSON с координатами.
     """
-    if power_on:
-        manip.nozzle_power(True)
-    manip.manage_gripper(rotation=int(angle_deg))
-    if power_off_after:
-        manip.nozzle_power(False)
-
-
-def main():
-    print("=== Проход по сохранённым точкам ===")
-
-    if not COORDS_FILE.exists():
-        raise FileNotFoundError(f"Файл с точками не найден: {COORDS_FILE.resolve()}")
-
-    saved = json.loads(COORDS_FILE.read_text(encoding="utf-8"))
-    if not isinstance(saved, dict) or not saved:
-        raise ValueError(f"В {COORDS_FILE} нет валидных точек.")
-
-    # Порядок dict сохранится таким, как был записан в coords3.json
-    points = list(saved.items())
-    print(f"[*] Найдено точек: {len(points)}")
-
-    manip = MEdu(HOST, CLIENT_ID, LOGIN, PASSWORD)
-    print("[*] Подключаемся…")
-    manip.connect()
-    print("[+] Подключено.")
+    if not path.exists():
+        print(f"[!] Файл с координатами не найден: {path}")
+        sys.exit(1)
 
     try:
-        manip.get_control()
-        print("[+] Получено управление манипулятором.")
+        with path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+    except json.JSONDecodeError as exc:
+        print(f"[!] Некорректный JSON в {path}: {exc}")
+        sys.exit(1)
+    except OSError as exc:
+        print(f"[!] Не удалось прочитать {path}: {exc}")
+        sys.exit(1)
 
-        for i, (name, pose) in enumerate(points, start=1):
-            try:
-                pos, ori = pose_to_params(pose)
-            except Exception as e:
-                print(f"[!] Пропуск «{name}»: не удалось разобрать позу ({e})")
-                continue
+    if not isinstance(data, dict):
+        print(f"[!] Ожидался словарь верхнего уровня в {path}")
+        sys.exit(1)
 
-            print(f"\n[{i}/{len(points)}] Едем в «{name}» ...")
-            manip.move_to_coordinates(
-                pos,
-                ori,
-                VELOCITY_SCALE,
-                ACCEL_SCALE,
-                PLANNER,
-                timeout_seconds=60.0,
-                throw_error=True,
-            )
-            print(f"    [✓] Достигнута «{name}»")
+    return data
 
-            if DWELL_BETWEEN_POINTS > 0:
-                time.sleep(DWELL_BETWEEN_POINTS)
 
-        print("\n[✓] Маршрут завершён.")
+COORDS: CoordinatesData = load_coordinates(COORDS_FILE)
 
-        # Пример использования вращения захвата (по необходимости):
-        # rotate_gripper(manip, angle_deg=45)  # раскомментируйте для теста
 
+def _get_pose_from_coords(point_name: str, tool: str) -> Dict[str, Dict[str, float]]:
+    """
+    Достаёт позицию и ориентацию из COORDS.
+    """
+    try:
+        point_data = COORDS[point_name][tool]
+        position = point_data["position"]
+        orientation = point_data["orientation"]
+    except KeyError as exc:
+        raise KeyError(
+            f"В файле {COORDS_FILE} нет точки '{point_name}' и/или инструмента '{tool}'"
+        ) from exc
+
+    return {"position": position, "orientation": orientation}
+
+
+# ===================== НИЗКОУРОВНЕВЫЕ ДВИЖЕНИЯ =====================
+
+def move(
+        manipulator: MEdu,
+        x: float,
+        y: float,
+        z: float,
+        ox: float,
+        oy: float,
+        oz: float,
+        ow: float,
+        velocity: float = VEL,
+        acceleration: float = ACC,
+        *,
+        timeout: float = 60.0,
+) -> None:
+    """
+    Блокирующий move: ждём завершения траектории, чтобы
+    следующая команда не «съела» промежуточную точку.
+    """
+    promise = safe_sdk_call(
+        "при отправке команды move_to_coordinates",
+        manipulator.move_to_coordinates,
+        MoveCoordinatesParamsPosition(x=x, y=y, z=z),
+        MoveCoordinatesParamsOrientation(x=ox, y=oy, z=oz, w=ow),
+        velocity_scaling_factor=velocity,
+        acceleration_scaling_factor=acceleration,
+    )
+
+    if hasattr(promise, "result"):
+        safe_sdk_call(
+            "при ожидании завершения движения",
+            promise.result,
+            timeout=timeout,
+        )
+    else:
+        time.sleep(0.2)
+
+
+def move_pose(
+        manipulator: MEdu,
+        point_name: str,
+        tool: str = "tool0",
+        velocity: float = VEL,
+        acceleration: float = ACC,
+) -> None:
+    """
+    Перемещает манипулятор в точку из COORDS.
+    """
+    pose = _get_pose_from_coords(point_name, tool)
+    position = pose["position"]
+    orientation = pose["orientation"]
+
+    move(
+        manipulator,
+        x=position["x"],
+        y=position["y"],
+        z=position["z"],
+        ox=orientation["x"],
+        oy=orientation["y"],
+        oz=orientation["z"],
+        ow=orientation["w"],
+        velocity=velocity,
+        acceleration=acceleration,
+    )
+
+
+def _set_gripper(manipulator: MEdu, rotation: float, angle: int) -> None:
+    """
+    Низкоуровневое управление захватом с логированием ошибок.
+    """
+    safe_sdk_call(
+        "при управлении захватом",
+        manipulator.manage_gripper,
+        rotation=rotation,
+        gripper=angle,
+    )
+
+
+def apply_sequence_gripper_action(manipulator: MEdu, point_name: str) -> None:
+    """
+    Применяет преднастроенное действие с захватом для точки, если оно есть.
+    """
+    config = SEQUENCE_GRIP_ACTIONS.get(point_name)
+    if not config:
+        return
+
+    rotation = float(config["rotation"])
+    angle = int(config["angle"])
+    _set_gripper(manipulator, rotation=rotation, angle=angle)
+
+
+# ===================== СЕТАП =====================
+
+def start(
+        host: str,
+        client_id: str,
+        login: str,
+        password: str,
+) -> MEdu:
+    """
+    Подключение к манипулятору и базовая инициализация.
+    """
+    manipulator = MEdu(host, client_id, login, password)
+
+    print("[*] Подключение к манипулятору...")
+    safe_sdk_call("при подключении", manipulator.connect)
+
+    print("[*] Запрашиваем управление...")
+    safe_sdk_call("при получении управления", manipulator.get_control)
+
+    print("[*] Подаём питание на насадку...")
+    safe_sdk_call("при подаче питания на насадку", manipulator.nozzle_power, True)
+
+    time.sleep(0.2)
+
+    print("[+] Манипулятор готов к работе")
+    return manipulator
+
+
+def end(manipulator: MEdu) -> None:
+    """
+    Завершение работы с манипулятором.
+    """
+    try:
+        safe_sdk_call("при отключении питания насадки", manipulator.nozzle_power, False)
+    except Exception:
+        pass
+
+    try:
+        safe_sdk_call("при освобождении управления", manipulator.release_control)
+    except Exception:
+        pass
+
+    try:
+        safe_sdk_call("при отключении от манипулятора", manipulator.disconnect)
+    except Exception:
+        pass
+
+
+# ===================== ОБХОД ТОЧЕК =====================
+
+def traverse_points_from_coords(manipulator: MEdu) -> None:
+    """
+    Последовательно обходит все точки из coords3.json
+    в порядке, указанном в файле.
+    Для некоторых точек дополнительно управляет захватом.
+    """
+    print("[=] Обход точек в порядке, как они идут в coords3.json:")
+
+    for name, tools in COORDS.items():
+        apply_sequence_gripper_action(manipulator, name)
+
+        if "tool0" not in tools:
+            print(f"[!] Для точки '{name}' нет координат tool0, точка пропущена")
+            continue
+
+        print(f"  -> {name}.tool0")
+        move_pose(manipulator, name, "tool0")
+
+    print("[✓] Обход всех точек завершён")
+
+
+# ===================== MAIN =====================
+
+def main() -> None:
+    manipulator: Optional[MEdu] = None
+
+    try:
+        manipulator = start(HOST, CLIENT_ID, LOGIN, PASSWORD)
+        traverse_points_from_coords(manipulator)
+        print("Готово")
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем")
+    except Exception as exc:
+        print(f"Некритичная ошибка верхнего уровня: {exc}")
     finally:
-        try:
-            manip.disconnect()
-            print("[*] Отключено.")
-        except Exception:
-            pass
+        if manipulator is not None:
+            end(manipulator)
 
 
 if __name__ == "__main__":

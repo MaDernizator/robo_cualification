@@ -1,55 +1,158 @@
-ZONE_SPEED = {"red":0.10, "yellow":0.50, "green":0.80}
-ZONE_BORDERS = [ -168, -112, -56, 0, 56, 112, 168 ]  # границы J1 в градусах (соответствуют 180,150,120,60,30,0)
+"""
+Вращение J1 с адаптивной скоростью.
+"""
 
-def zone_of_j1(j1_deg):
-    # 0..±168: красные на краях, жёлтые рядом, зелёная в центре
-    if abs(j1_deg) > 112: return "red"
-    if abs(j1_deg) > 56:  return "yellow"
-    return "green"
+import time
+from sdk.manipulators.medu import MEdu
 
-def nearest_border_between(a, b):
-    lo, hi = (a, b) if a < b else (b, a)
-    mids = [x for x in ZONE_BORDERS if lo < x < hi]
-    return min(mids, key=lambda x: abs(x-a)) if mids else None
+# === Подключение ===
+HOST = "10.5.0.2"
+LOGIN = "user"
+PASSWORD = "pass"
+CLIENT_ID = "j1-guard-move"
 
-def rad2deg(r): return r*180/3.1415926535
-def deg2rad(d): return d*3.1415926535/180
+# === Безопасная поза ===
+SAFE_SHOULDER_ANGLE = -0.35  # J2: плечо — вверх
+SAFE_ELBOW_ANGLE = -0.75  # J3: стрела — вперёд
 
+# === Зоны скорости для J1 ===
+SPEED_BY_ZONE = {
+    "red": 0.10,  # Медленно в опасной зоне
+    "yellow": 0.50,  # Средняя скорость в промежуточной зоне
+    "green": 0.80  # Быстро в безопасной зоне
+}
+ZONE_BORDERS_DEGREES = [-90.0, -60.0, -30.0, 0.0, 30.0, 60.0, 90.0]  # Границы зон в градусах
+
+
+# --- Вспомогательные функции ---
+
+def rad2deg(radians):
+    """Конвертация радианов в градусы"""
+    return float(radians) * 180.0 / 3.141592653589793
+
+
+def deg2rad(degrees):
+    """Конвертация градусов в радианы"""
+    return float(degrees) * 3.141592653589793 / 180.0
+
+
+def zone_of_j1(j1_degrees):
+    """Определение зоны безопасности по углу J1"""
+    if abs(j1_degrees) > 112:
+        return "red"  # Опасная зона
+    if abs(j1_degrees) > 56:
+        return "yellow"  # Промежуточная зона
+    return "green"  # Безопасная зона
+
+
+def nearest_border_between(angle_start, angle_end):
+    """Поиск ближайшей границы зоны между двумя углами"""
+    lower_angle, upper_angle = (angle_start, angle_end) if angle_start < angle_end else (angle_end, angle_start)
+    borders_in_range = [border for border in ZONE_BORDERS_DEGREES if lower_angle < border < upper_angle]
+    return min(borders_in_range, key=lambda border: abs(border - angle_start)) if borders_in_range else None
+
+
+# --- Основной класс ---
 class SpeedGuard:
-    def __init__(self, robot, safe_j2, safe_j3):
-        self.r = robot
-        self.safe_j2 = safe_j2
-        self.safe_j3 = safe_j3
+    """Класс для управления движением с адаптивной скоростью"""
 
-    def move_j1_guarded(self, j1_target_deg, max_step_deg=5):
-        # едем по J1, автоматически меняя скорость по зонам
-        j1_now = rad2deg(self.r.get_joint_angles()[0])
-        direction = 1 if j1_target_deg > j1_now else -1
+    def __init__(self, robot, safe_shoulder_angle, safe_elbow_angle):
+        self.robot = robot
+        self.safe_shoulder_angle = safe_shoulder_angle
+        self.safe_elbow_angle = safe_elbow_angle
 
-        while abs(j1_target_deg - j1_now) > 0.5:
-            # ближайшая граница зоны на пути
-            border = nearest_border_between(j1_now, j1_target_deg)
-            # подцель = ближайшая граница или маленький шаг, что ближе
-            candidate = j1_now + direction*max_step_deg
-            sub_target = (
-                border if (border is not None and
-                           abs(border - j1_now) < abs(candidate - j1_now))
-                else candidate
+    def move_j1_guarded(self, j1_target_degrees, max_step_degrees=5.0):
+        """Безопасное движение J1 к целевому углу с адаптивной скоростью"""
+        # Получаем текущий угол J1 и преобразуем в градусы
+        current_angles = self.robot.get_joint_angles()
+        j1_current_radians = float(current_angles[0])
+        j1_current_degrees = rad2deg(j1_current_radians)
+
+        # Определяем направление движения
+        direction = 1 if j1_target_degrees > j1_current_degrees else -1
+
+        # Движемся по шагам до достижения цели
+        while abs(j1_target_degrees - j1_current_degrees) > 0.5:
+            # Находим ближайшую границу зоны
+            nearest_border = nearest_border_between(j1_current_degrees, j1_target_degrees)
+
+            # Вычисляем промежуточную цель (либо граница зоны, либо шаг)
+            step_candidate = j1_current_degrees + direction * max_step_degrees
+
+            if nearest_border is not None and abs(nearest_border - j1_current_degrees) < abs(
+                    step_candidate - j1_current_degrees):
+                subtarget_degrees = nearest_border
+            else:
+                subtarget_degrees = step_candidate
+
+            # Ограничиваем промежуточную цель финальной целью
+            if (direction > 0 and subtarget_degrees > j1_target_degrees) or \
+                    (direction < 0 and subtarget_degrees < j1_target_degrees):
+                subtarget_degrees = j1_target_degrees
+
+            # Определяем скорость для текущей зоны
+            current_zone = zone_of_j1(j1_current_degrees)
+            velocity_factor = SPEED_BY_ZONE[current_zone]
+
+            print(
+                f"[J1] {j1_current_degrees:.1f}° → {subtarget_degrees:.1f}° | зона: {current_zone} | vf={velocity_factor}")
+
+            # Выполняем движение
+            self.robot.move_to_angles(
+                deg2rad(subtarget_degrees),
+                self.safe_shoulder_angle,
+                self.safe_elbow_angle,
+                velocity_factor=velocity_factor,
+                acceleration_factor=0.2
             )
-            # не перелететь конечную
-            if (direction > 0 and sub_target > j1_target_deg) or (direction < 0 and sub_target < j1_target_deg):
-                sub_target = j1_target_deg
 
-            vf = ZONE_SPEED[zone_of_j1(j1_now)]
-            self.r.move_to_angles(deg2rad(sub_target), self.safe_j2, self.safe_j3,
-                                  velocity_factor=vf, acceleration_factor=0.2)
-            j1_now = rad2deg(self.r.get_joint_angles()[0])
+            # Обновляем текущую позицию
+            current_angles = self.robot.get_joint_angles()
+            j1_current_radians = float(current_angles[0])
+            j1_current_degrees = rad2deg(j1_current_radians)
 
-    def move_waypoints_guarded(self, j1_sequence_deg):
-        for j1_deg in j1_sequence_deg:
-            self.move_j1_guarded(j1_deg)
+    def move_waypoints_guarded(self, j1_waypoints_degrees):
+        """Последовательное движение через список точек"""
+        for target_degrees in j1_waypoints_degrees:
+            print(f"\n[ROUTE] → J1 = {target_degrees}°")
+            self.move_j1_guarded(target_degrees)
 
-# ---- пример использования ----
-# guard = SpeedGuard(m, SAFE_J2, SAFE_J3)
-# guard.move_j1_guarded(+168)     # вправо
-# guard.move_waypoints_guarded([+100, +40, -20, -90, -168])  # произвольный маршрут по J1
+
+# --- Запуск ---
+def main():
+    print("[INFO] Подключение...")
+    manipulator = MEdu(HOST, CLIENT_ID, LOGIN, PASSWORD)
+    manipulator.connect()
+
+    try:
+        print("[INFO] Захват управления...")
+        manipulator.get_control()
+
+        # Переводим робота в исходную позу (центр)
+        print("[INIT] В центр (J1=0°)...")
+        manipulator.move_to_angles(0.0, SAFE_SHOULDER_ANGLE, SAFE_ELBOW_ANGLE, velocity_factor=0.3)
+
+        # Создаем контроллер с адаптивной скоростью
+        speed_guard = SpeedGuard(manipulator, SAFE_SHOULDER_ANGLE, SAFE_ELBOW_ANGLE)
+
+        # Маршрут движения: центр → право → лево → центр
+        waypoints = [90, -90, 0]
+
+        print("\n[GO] Начало движения с адаптивной скоростью...")
+        speed_guard.move_waypoints_guarded(waypoints)
+
+        print("\nГотово!")
+
+    except KeyboardInterrupt:
+        print("\nПрервано пользователем")
+    except Exception as error:
+        print(f"\nОшибка: {error}")
+    finally:
+        try:
+            manipulator.release_control()
+        except:
+            pass
+
+
+if __name__ == "__main__":
+    main()
