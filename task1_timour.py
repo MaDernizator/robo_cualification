@@ -14,6 +14,8 @@ manipulator.connect()
 # Получение управления
 manipulator.get_control()
 
+# функция которая поворачивает руку влево вправо
+# manipulator - объект руки, speed - скорость движениея, angle - угол поворота вокруг основания
 def move_to_angles(manipulator : MEdu, speed : float, angle : float):
     manipulator.move_to_angles(
         povorot_osnovaniya=angle,   # Угол поворота основания (радианы)
