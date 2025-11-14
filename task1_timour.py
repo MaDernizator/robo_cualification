@@ -31,9 +31,9 @@ class PromobotManipulator:
             self._is_controlled = True
 
     
-    # функция которая поворачивает руку влево вправо при заданых других углах поворота
+    # функция которая поворачивает руку влево вправо при статичных заданных других углах поворота
     def move_to_angles(self,
-                       speed: float, # скорость движениея
+                       speed: float, # скорость движениея 0.0-1.0
                        angle: float  # угол поворота вокруг основания
                        ):
         if not self._is_connected:
@@ -69,26 +69,29 @@ class PromobotManipulator:
 # ЗАПУСК 1 задания
 # ===========================
 
+# создаём объект
 manipulator = PromobotManipulator(host="10.5.0.2")
 
+# подключаемся и получаем управление что бы дальше упровлять рукой
 manipulator.connect()
 manipulator.get_control()
 
-# движение на старт
+# движение на старт(справа)
 manipulator.move_to_angles(speed=1.0, angle=1.0)
 
-# проход справа налево
-manipulator.move_to_angles(speed=0.7, angle=0.1)
-manipulator.move_to_angles(speed=0.3, angle=0.3)
-manipulator.move_to_angles(speed=0.8, angle=0.0)
-manipulator.move_to_angles(speed=0.3, angle=-0.3)
-manipulator.move_to_angles(speed=0.1, angle=-1.0)
+# проход справа на лево 
+manipulator.move_to_angles(0.7, 0.1) # прохождение крайней зоны
+manipulator.move_to_angles(0.3, 0.3) # прохождение средней зоны
+manipulator.move_to_angles(-0.3, 0.8) # прохождение центральной зоны
+manipulator.move_to_angles(-0.7, 0.3) # прохождение средней зоны
+manipulator.move_to_angles(-1, 0.1) # прохождение крайней зоны
 
-# обратный путь
-manipulator.move_to_angles(speed=0.1, angle=-0.7)
-manipulator.move_to_angles(speed=0.3, angle=-0.3)
-manipulator.move_to_angles(speed=0.8, angle=0.0)
-manipulator.move_to_angles(speed=0.3, angle=0.3)
-manipulator.move_to_angles(speed=0.1, angle=1.0)
+# возвращение в начало
+manipulator.move_to_angles(-0.7, 0.1) # прохождение крайней зоны
+manipulator.move_to_angles(-0.3, 0.3) # прохождение средней зоны
+manipulator.move_to_angles(0.3, 0.8) # прохождение центральной зоны
+manipulator.move_to_angles(0.7, 0.3) # прохождение средней зоны
+manipulator.move_to_angles(1, 0.1) # прохождение крайней зоны
 
+# отключаемся
 manipulator.disconnect()
