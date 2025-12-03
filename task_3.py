@@ -12,7 +12,7 @@ from sdk.manipulators.medu import MEdu
 
 # ===================== КОНФИГУРАЦИЯ =====================
 
-HOST = "10.5.0.2"
+HOST = "192.168.0.183"
 CLIENT_ID = "test-client"
 LOGIN = "user"
 PASSWORD = "pass"
