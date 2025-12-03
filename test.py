@@ -314,10 +314,7 @@ if __name__ == "__main__":
         test_read_states(manipulator)
         test_move_cartesian(manipulator)
         test_move_joints(manipulator)
-
-        test_nozzle_power(manipulator)
         test_gripper(manipulator)
-
         test_play_audio(manipulator)
 
     except (ConnectionError, CommandTimeout, CommandError, SdkError) as e:
