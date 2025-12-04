@@ -443,35 +443,35 @@ if __name__ == "__main__":
         manipulator = connect_medu()
 
         # 1) Чтение состояний
-        states = read_states(manipulator)
-        print("Состояния манипулятора:", states)
+        # states = read_states(manipulator)
+        # print("Состояния манипулятора:", states)
 
         # 2) Движение в декартовых координатах
-        move_cartesian(
-            manipulator,
-            x=0.30,
-            y=0.00,
-            z=0.20,
-            velocity_scaling_factor=0.1,
-            acceleration_scaling_factor=0.1,
-            planner_type="LIN",
-        )
+        # move_cartesian(
+        #     manipulator,
+        #     x=0.30,
+        #     y=0.00,
+        #     z=0.20,
+        #     velocity_scaling_factor=0.1,
+        #     acceleration_scaling_factor=0.1,
+        #     planner_type="LIN",
+        # )
 
-        # 3) Движение по суставам
-        move_joints(
-            manipulator,
-            povorot_osnovaniya=0.0,
-            privod_plecha=-0.3,
-            privod_strely=-0.7,
-            velocity_factor=0.1,
-            acceleration_factor=0.1,
-        )
+        # # 3) Движение по суставам
+        # move_joints(
+        #     manipulator,
+        #     povorot_osnovaniya=0.0,
+        #     privod_plecha=-0.3,
+        #     privod_strely=-0.7,
+        #     velocity_factor=0.1,
+        #     acceleration_factor=0.1,
+        # )
 
         # 4) Управление гриппером
-        set_gripper(manipulator, rotation_deg=20, gripper_deg=40)
+        set_gripper(manipulator, rotation_deg=90, gripper_deg=-20)
 
         # 5) Воспроизведение аудио
-        play_audio(manipulator, "0.wav")
+        # play_audio(manipulator, "0.wav")
 
     except (ConnectionError, CommandTimeout, CommandError, SdkError) as e:
         print("Ошибка SDK:", e)
