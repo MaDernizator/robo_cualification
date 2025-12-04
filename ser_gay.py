@@ -29,10 +29,12 @@ import threading
 # ============================================================================
 
 # Параметры подключения к манипулятору
-HOST = "192.168.0.183"
-CLIENT_ID = "122"
-LOGIN = "13"
-PASSWORD = "14"
+
+HOST = "192.168.0.183"   # IP манипулятора
+CLIENT_ID = "test-client"         # ID клиента
+LOGIN = "user"              # Логин
+PASSWORD = "pass"           # Пароль
+
 
 # GPIO пин для светодиода
 GPIO_LED_PIN = "/dev/gpiochip4/e1_pin"
@@ -678,7 +680,7 @@ def main():
         # move_by_angles(manipulator)
 
         # 2. Движения по координатам (ОБНОВЛЕНО - точные координаты)
-        move_by_coordinates(manipulator)
+        # move_by_coordinates(manipulator)
 
         # 3. Перемещение домой (ОБНОВЛЕНО - новые параметры)
         # move_to_home(manipulator)
@@ -692,7 +694,7 @@ def main():
         # track_coordinates_polling(manipulator)
 
         # 6. Чтение GPIO (НОВОЕ)
-        # gpio_read_test(manipulator)
+        gpio_read_test(manipulator)
 
         # 7. Воспроизведение аудио (НОВОЕ)
         # play_audio_test(manipulator)

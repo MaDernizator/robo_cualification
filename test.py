@@ -25,7 +25,7 @@ from typing import Optional
 
 # ----- Настройки по умолчанию для подключения -----
 
-DEFAULT_HOST = "10.5.0.2"
+DEFAULT_HOST = "192.168.0.183"
 DEFAULT_CLIENT_ID = "test-client"
 DEFAULT_LOGIN = "user"
 DEFAULT_PASSWORD = "pass"
@@ -311,11 +311,11 @@ if __name__ == "__main__":
 
         # Раскомментируйте те строки, которые хотите проверить сейчас:
 
-        test_read_states(manipulator)
+        # test_read_states(manipulator)
         test_move_cartesian(manipulator)
-        test_move_joints(manipulator)
-        test_gripper(manipulator)
-        test_play_audio(manipulator)
+        # test_move_joints(manipulator)
+        # test_gripper(manipulator)
+        # test_play_audio(manipulator)
 
     except (ConnectionError, CommandTimeout, CommandError, SdkError) as e:
         print("Ошибка SDK:", e)
